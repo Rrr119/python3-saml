@@ -24,6 +24,8 @@ import xmlsec
 from onelogin.saml2 import compat
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.errors import OneLogin_Saml2_Error, OneLogin_Saml2_ValidationError
+from onelogin.saml2.x509 import format_certificate_status
+from onelogin.saml2.x509 import get_certificate_status
 from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
 
 
@@ -542,6 +544,20 @@ class OneLogin_Saml2_Utils(object):
         return fingerprint.hexdigest().lower()
 
     @staticmethod
+    def get_certificate_status(cert, now=None):
+        """
+        Returns the validity status and diagnostics of a formatted x509 cert.
+        """
+        return get_certificate_status(cert, now)
+
+    @staticmethod
+    def validate_certificate_dates(cert, now=None):
+        """
+        Returns True when the certificate is inside its validity window.
+        """
+        return get_certificate_status(cert, now)["status"] == "valid"
+
+    @staticmethod
     def format_finger_print(fingerprint):
         """
         Formats a fingerprint.
@@ -777,7 +793,19 @@ class OneLogin_Saml2_Utils(object):
 
     @staticmethod
     @return_false_on_exception
-    def validate_sign(xml, cert=None, fingerprint=None, fingerprintalg="sha1", validatecert=False, debug=False, xpath=None, multicerts=None):
+    def validate_sign(
+        xml,
+        cert=None,
+        fingerprint=None,
+        fingerprintalg="sha1",
+        validatecert=False,
+        debug=False,
+        xpath=None,
+        multicerts=None,
+        check_cert_validity=False,
+        idp_entity_id=None,
+        rejected_certs=None,
+    ):
         """
         Validates a signature (Message or Assertion).
 
@@ -805,6 +833,15 @@ class OneLogin_Saml2_Utils(object):
         :param multicerts: Multiple public certs
         :type: list
 
+        :param check_cert_validity: Reject certificates outside their validity window
+        :type check_cert_validity: bool
+
+        :param idp_entity_id: IdP entityId, included in diagnostics
+        :type idp_entity_id: string
+
+        :param rejected_certs: Certificate status records excluded from trust
+        :type rejected_certs: list
+
         :param raise_exceptions: Whether to return false on failure or raise an exception
         :type raise_exceptions: Boolean
         """
@@ -827,16 +864,95 @@ class OneLogin_Saml2_Utils(object):
             signature_node = signature_nodes[0]
 
             if not multicerts:
-                return OneLogin_Saml2_Utils.validate_node_sign(signature_node, elem, cert, fingerprint, fingerprintalg, validatecert, debug, raise_exceptions=True)
+                return OneLogin_Saml2_Utils.validate_node_sign(
+                    signature_node,
+                    elem,
+                    cert,
+                    fingerprint,
+                    fingerprintalg,
+                    validatecert,
+                    debug,
+                    raise_exceptions=True,
+                    check_cert_validity=check_cert_validity,
+                    idp_entity_id=idp_entity_id,
+                )
             else:
                 # If multiple certs are provided, I may ignore cert and
                 # fingerprint provided by the method and just check the
                 # certs multicerts
                 fingerprint = fingerprintalg = None
+                failures = []
+                seen = set()
                 for cert in multicerts:
-                    if OneLogin_Saml2_Utils.validate_node_sign(signature_node, elem, cert, fingerprint, fingerprintalg, validatecert, False, raise_exceptions=False):
-                        return True
-                raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected.", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
+                    cert_key = OneLogin_Saml2_Utils.format_cert(cert)
+                    if cert_key in seen:
+                        continue
+                    seen.add(cert_key)
+                    try:
+                        if OneLogin_Saml2_Utils.validate_node_sign(
+                            signature_node,
+                            elem,
+                            cert,
+                            fingerprint,
+                            fingerprintalg,
+                            validatecert,
+                            debug,
+                            raise_exceptions=True,
+                            check_cert_validity=check_cert_validity,
+                            idp_entity_id=idp_entity_id,
+                        ):
+                            return True
+                    except OneLogin_Saml2_ValidationError as exc:
+                        failures.append(exc)
+                    except Exception as exc:
+                        failures.append(
+                            OneLogin_Saml2_ValidationError(
+                                "Signature validation failed. SAML Response rejected. %s" % exc,
+                                OneLogin_Saml2_ValidationError.INVALID_SIGNATURE,
+                            )
+                        )
+
+                if failures:
+                    codes = [getattr(failure, "code", None) for failure in failures]
+                    if all(
+                        code
+                        in (
+                            OneLogin_Saml2_ValidationError.SIGNATURE_CERT_EXPIRED,
+                            OneLogin_Saml2_ValidationError.SIGNATURE_CERT_NOT_YET_VALID,
+                        )
+                        for code in codes
+                    ):
+                        code = codes[0]
+                    else:
+                        code = OneLogin_Saml2_ValidationError.INVALID_SIGNATURE
+                    reason = " ".join("(%s)" % failure for failure in failures)
+                    for rejected in rejected_certs or []:
+                        if rejected.get("reason"):
+                            reason += " (excluded certificate: %s)" % rejected["reason"]
+                    details = {
+                        "idp_entity_id": idp_entity_id,
+                        "signature_count": len(failures),
+                        "certificate_errors": codes,
+                    }
+                    raise OneLogin_Saml2_ValidationError(
+                        "Signature validation failed. SAML Response rejected. %s" % reason,
+                        code,
+                        reason=reason,
+                        details=details,
+                    )
+                if rejected_certs:
+                    reason = " ".join("(excluded certificate: %s)" % item.get("reason") for item in rejected_certs if item.get("reason"))
+                    raise OneLogin_Saml2_ValidationError(
+                        "Signature validation failed. SAML Response rejected. No trusted IdP signing certificate was available. %s" % reason,
+                        OneLogin_Saml2_ValidationError.SIGNATURE_CERT_NOT_FOUND,
+                        reason=reason,
+                        details={"idp_entity_id": idp_entity_id, "rejected_certificates": rejected_certs},
+                    )
+                raise OneLogin_Saml2_ValidationError(
+                    "Signature validation failed. SAML Response rejected. No trusted IdP signing certificate was available.",
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_NOT_FOUND,
+                    details={"idp_entity_id": idp_entity_id},
+                )
         else:
             raise OneLogin_Saml2_ValidationError("Expected exactly one signature node; got {}.".format(len(signature_nodes)), OneLogin_Saml2_ValidationError.WRONG_NUMBER_OF_SIGNATURES)
 
@@ -893,7 +1009,17 @@ class OneLogin_Saml2_Utils(object):
 
     @staticmethod
     @return_false_on_exception
-    def validate_node_sign(signature_node, elem, cert=None, fingerprint=None, fingerprintalg="sha1", validatecert=False, debug=False):
+    def validate_node_sign(
+        signature_node,
+        elem,
+        cert=None,
+        fingerprint=None,
+        fingerprintalg="sha1",
+        validatecert=False,
+        debug=False,
+        check_cert_validity=False,
+        idp_entity_id=None,
+    ):
         """
         Validates a signature node.
 
@@ -920,6 +1046,9 @@ class OneLogin_Saml2_Utils(object):
 
         :param raise_exceptions: Whether to return false on failure or raise an exception
         :type raise_exceptions: Boolean
+
+        :param check_cert_validity: Reject certificates outside their validity window
+        :type check_cert_validity: bool
         """
         if (cert is None or cert == "") and fingerprint:
             x509_certificate_nodes = OneLogin_Saml2_XML.query(signature_node, "//ds:Signature/ds:KeyInfo/ds:X509Data/ds:X509Certificate")
@@ -933,6 +1062,40 @@ class OneLogin_Saml2_Utils(object):
 
         if cert is None or cert == "":
             raise OneLogin_Saml2_Error("Could not validate node signature: No certificate provided.", OneLogin_Saml2_Error.CERT_NOT_FOUND)
+
+        cert_status = get_certificate_status(cert)
+        if check_cert_validity:
+            if cert_status["status"] == "expired":
+                diagnostic = format_certificate_status(cert_status)
+                raise OneLogin_Saml2_ValidationError(
+                    "%s. Certificate: %s. Signature validation failed. SAML Response rejected.%s" % (
+                        cert_status["reason"],
+                        diagnostic,
+                        " IdP entityId=%s." % idp_entity_id if idp_entity_id else "",
+                    ),
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_EXPIRED,
+                    reason=cert_status["reason"],
+                    details=dict(cert_status, idp_entity_id=idp_entity_id),
+                )
+            if cert_status["status"] == "not_yet_valid":
+                diagnostic = format_certificate_status(cert_status)
+                raise OneLogin_Saml2_ValidationError(
+                    "%s. Certificate: %s. Signature validation failed. SAML Response rejected.%s" % (
+                        cert_status["reason"],
+                        diagnostic,
+                        " IdP entityId=%s." % idp_entity_id if idp_entity_id else "",
+                    ),
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_NOT_YET_VALID,
+                    reason=cert_status["reason"],
+                    details=dict(cert_status, idp_entity_id=idp_entity_id),
+                )
+            if cert_status["status"] == "invalid":
+                raise OneLogin_Saml2_ValidationError(
+                    "%s. Signature validation failed. SAML Response rejected." % cert_status["reason"],
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_INVALID,
+                    reason=cert_status["reason"],
+                    details=dict(cert_status, idp_entity_id=idp_entity_id),
+                )
 
         # Check if Reference URI is empty
         # reference_elem = OneLogin_Saml2_XML.query(signature_node, '//ds:Reference')
@@ -953,7 +1116,17 @@ class OneLogin_Saml2_Utils(object):
         try:
             dsig_ctx.verify(signature_node)
         except Exception as err:
-            raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected. %s", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE, str(err))
+            diagnostic = format_certificate_status(cert_status)
+            reason = "cryptographic signature mismatch"
+            if cert_status["status"] != "valid":
+                reason += "; %s" % cert_status["reason"]
+            raise OneLogin_Saml2_ValidationError(
+                "Signature validation failed. SAML Response rejected. Reason: %s. Certificate: %s. xmlsec: %s"
+                % (reason, diagnostic, str(err)),
+                OneLogin_Saml2_ValidationError.INVALID_SIGNATURE,
+                reason=reason,
+                details=dict(cert_status, idp_entity_id=idp_entity_id, xmlsec_error=str(err)),
+            )
 
         return True
 
@@ -984,7 +1157,15 @@ class OneLogin_Saml2_Utils(object):
         return dsig_ctx.sign_binary(compat.to_bytes(msg), algorithm)
 
     @staticmethod
-    def validate_binary_sign(signed_query, signature, cert=None, algorithm=OneLogin_Saml2_Constants.RSA_SHA256, debug=False):
+    def validate_binary_sign(
+        signed_query,
+        signature,
+        cert=None,
+        algorithm=OneLogin_Saml2_Constants.RSA_SHA256,
+        debug=False,
+        check_cert_validity=False,
+        idp_entity_id=None,
+    ):
         """
         Validates signed binary data (Used to validate GET Signature).
 
@@ -1003,7 +1184,43 @@ class OneLogin_Saml2_Utils(object):
 
         :param debug: Activate the xmlsec debug
         :type: bool
+
+        :param check_cert_validity: Reject certificates outside their validity window
+        :type: bool
         """
+        if check_cert_validity:
+            cert_status = get_certificate_status(cert)
+            if cert_status["status"] == "expired":
+                diagnostic = format_certificate_status(cert_status)
+                raise OneLogin_Saml2_ValidationError(
+                    "%s. Certificate: %s. Signature validation failed.%s" % (
+                        cert_status["reason"],
+                        diagnostic,
+                        " IdP entityId=%s." % idp_entity_id if idp_entity_id else "",
+                    ),
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_EXPIRED,
+                    reason=cert_status["reason"],
+                    details=dict(cert_status, idp_entity_id=idp_entity_id),
+                )
+            if cert_status["status"] == "not_yet_valid":
+                diagnostic = format_certificate_status(cert_status)
+                raise OneLogin_Saml2_ValidationError(
+                    "%s. Certificate: %s. Signature validation failed.%s" % (
+                        cert_status["reason"],
+                        diagnostic,
+                        " IdP entityId=%s." % idp_entity_id if idp_entity_id else "",
+                    ),
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_NOT_YET_VALID,
+                    reason=cert_status["reason"],
+                    details=dict(cert_status, idp_entity_id=idp_entity_id),
+                )
+            if cert_status["status"] == "invalid":
+                raise OneLogin_Saml2_ValidationError(
+                    "%s. Signature validation failed." % cert_status["reason"],
+                    OneLogin_Saml2_ValidationError.SIGNATURE_CERT_INVALID,
+                    reason=cert_status["reason"],
+                    details=dict(cert_status, idp_entity_id=idp_entity_id),
+                )
         try:
             xmlsec.enable_debug_trace(debug)
             dsig_ctx = xmlsec.SignatureContext()

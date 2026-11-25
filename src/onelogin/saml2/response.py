@@ -33,6 +33,7 @@ class OneLogin_Saml2_Response(object):
         """
         self._settings = settings
         self._error = None
+        self._error_code = None
         self.response = OneLogin_Saml2_Utils.b64decode(response)
         self.document = OneLogin_Saml2_XML.to_etree(self.response)
         self.decrypted_document = None
@@ -63,7 +64,11 @@ class OneLogin_Saml2_Response(object):
         :rtype: bool
         """
         self._error = None
+        self._error_code = None
         try:
+            if hasattr(self._settings, "refresh_metadata_if_due"):
+                self._settings.refresh_metadata_if_due()
+
             # Checks SAML version
             if self.document.get("Version", None) != "2.0":
                 raise OneLogin_Saml2_ValidationError("Unsupported SAML version", OneLogin_Saml2_ValidationError.UNSUPPORTED_SAML_VERSION)
@@ -232,37 +237,93 @@ class OneLogin_Saml2_Response(object):
             if not signed_elements or (not has_signed_response and not has_signed_assertion):
                 raise OneLogin_Saml2_ValidationError("No Signature found. SAML Response rejected", OneLogin_Saml2_ValidationError.NO_SIGNATURE_FOUND)
             else:
-                cert = self._settings.get_idp_cert()
-                fingerprint = idp_data.get("certFingerprint", None)
-                if fingerprint:
-                    fingerprint = OneLogin_Saml2_Utils.format_finger_print(fingerprint)
-                fingerprintalg = idp_data.get("certFingerprintAlgorithm", None)
-
-                multicerts = None
-                if "x509certMulti" in idp_data and "signing" in idp_data["x509certMulti"] and idp_data["x509certMulti"]["signing"]:
-                    multicerts = idp_data["x509certMulti"]["signing"]
+                cert, fingerprint, fingerprintalg, multicerts, check_cert_validity, rejected_certs, idp_entity_id, diagnostic_mode = (
+                    self._prepare_signature_validation(idp_data)
+                )
 
                 # If find a Signature on the Response, validates it checking the original response
                 if has_signed_response and not OneLogin_Saml2_Utils.validate_sign(
-                    self.document, cert, fingerprint, fingerprintalg, xpath=OneLogin_Saml2_Utils.RESPONSE_SIGNATURE_XPATH, multicerts=multicerts, raise_exceptions=False
+                    self.document,
+                    cert,
+                    fingerprint,
+                    fingerprintalg,
+                    xpath=OneLogin_Saml2_Utils.RESPONSE_SIGNATURE_XPATH,
+                    multicerts=multicerts,
+                    raise_exceptions=diagnostic_mode,
+                    check_cert_validity=check_cert_validity,
+                    idp_entity_id=idp_entity_id,
+                    rejected_certs=rejected_certs,
                 ):
                     raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
 
                 document_check_assertion = self.decrypted_document if self.encrypted else self.document
                 if has_signed_assertion and not OneLogin_Saml2_Utils.validate_sign(
-                    document_check_assertion, cert, fingerprint, fingerprintalg, xpath=OneLogin_Saml2_Utils.ASSERTION_SIGNATURE_XPATH, multicerts=multicerts, raise_exceptions=False
+                    document_check_assertion,
+                    cert,
+                    fingerprint,
+                    fingerprintalg,
+                    xpath=OneLogin_Saml2_Utils.ASSERTION_SIGNATURE_XPATH,
+                    multicerts=multicerts,
+                    raise_exceptions=diagnostic_mode,
+                    check_cert_validity=check_cert_validity,
+                    idp_entity_id=idp_entity_id,
+                    rejected_certs=rejected_certs,
                 ):
                     raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
 
             return True
         except Exception as err:
             self._error = str(err)
+            self._error_code = getattr(err, "code", None)
             debug = self._settings.is_debug_active()
             if debug:
                 print(err)
             if raise_exceptions:
                 raise
             return False
+
+    def _prepare_signature_validation(self, idp_data):
+        cert = self._settings.get_idp_cert()
+        fingerprint = idp_data.get("certFingerprint", None)
+        if fingerprint:
+            fingerprint = OneLogin_Saml2_Utils.format_finger_print(fingerprint)
+        fingerprintalg = idp_data.get("certFingerprintAlgorithm", None)
+
+        multicerts = None
+        if "x509certMulti" in idp_data and "signing" in idp_data["x509certMulti"] and idp_data["x509certMulti"]["signing"]:
+            multicerts = idp_data["x509certMulti"]["signing"]
+
+        check_cert_validity = False
+        if hasattr(self._settings, "should_validate_idp_certificate_dates"):
+            check_cert_validity = self._settings.should_validate_idp_certificate_dates()
+        rejected_certs = []
+        if hasattr(self._settings, "get_idp_rejected_certificates"):
+            rejected_certs = self._settings.get_idp_rejected_certificates()
+        idp_entity_id = idp_data.get("entityId")
+        diagnostic_mode = check_cert_validity or bool(rejected_certs)
+
+        if not cert and not multicerts and diagnostic_mode:
+            self._raise_no_trusted_certificate(rejected_certs, idp_entity_id)
+        return cert, fingerprint, fingerprintalg, multicerts, check_cert_validity, rejected_certs, idp_entity_id, diagnostic_mode
+
+    def _raise_no_trusted_certificate(self, rejected_certs, idp_entity_id):
+        reasons = []
+        for item in rejected_certs:
+            if item.get("reason"):
+                fingerprint = item.get("fingerprint")
+                reasons.append("%s%s" % (item["reason"], " (sha256=%s)" % fingerprint if fingerprint else ""))
+        reason = "; ".join(reasons) or "No trusted IdP signing certificate is available"
+        if hasattr(self._settings, "get_metadata_last_error"):
+            metadata_error = self._settings.get_metadata_last_error()
+            if metadata_error:
+                reason += "; last metadata refresh failed: %s" % metadata_error
+        expired = any(item.get("status") == "expired" for item in rejected_certs)
+        raise OneLogin_Saml2_ValidationError(
+            "Signature validation failed. SAML Response rejected. %s" % reason,
+            OneLogin_Saml2_ValidationError.SIGNATURE_CERT_EXPIRED if expired else OneLogin_Saml2_ValidationError.SIGNATURE_CERT_NOT_FOUND,
+            reason=reason,
+            details={"idp_entity_id": idp_entity_id, "rejected_certificates": rejected_certs},
+        )
 
     def check_status(self):
         """
@@ -773,6 +834,12 @@ class OneLogin_Saml2_Response(object):
         After executing a validation process, if it fails this method returns the cause
         """
         return self._error
+
+    def get_error_code(self):
+        """
+        Returns the OneLogin_Saml2_ValidationError code of the last error.
+        """
+        return self._error_code
 
     def get_xml_document(self):
         """

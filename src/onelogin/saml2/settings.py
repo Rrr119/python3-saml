@@ -15,6 +15,7 @@ from os.path import dirname, exists, join, sep
 from onelogin.saml2 import compat
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.errors import OneLogin_Saml2_Error
+from onelogin.saml2.metadata_manager import OneLogin_Saml2_IdPMetadataManager
 from onelogin.saml2.metadata import OneLogin_Saml2_Metadata
 from onelogin.saml2.utils import OneLogin_Saml2_Utils
 from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
@@ -108,6 +109,9 @@ class OneLogin_Saml2_Settings(object):
         self._contacts = {}
         self._organization = {}
         self._errors = []
+        self._raw_settings = {}
+        self._metadata_manager = None
+        self._idp_metadata_managed = False
 
         self._load_paths(base_path=custom_base_path)
         self._update_paths(settings)
@@ -135,6 +139,13 @@ class OneLogin_Saml2_Settings(object):
                 'Unsupported settings object',
                 OneLogin_Saml2_Error.UNSUPPORTED_SETTINGS_OBJECT
             )
+
+        self._metadata_manager = OneLogin_Saml2_IdPMetadataManager(self)
+        self._idp_metadata_managed = self._metadata_manager.enabled
+        if self._metadata_manager.initial_refresh:
+            # Initial load is best effort.  Static settings remain usable and
+            # the failure is available through get_metadata_status().
+            self._metadata_manager.refresh(force=True)
 
         self.format_idp_cert()
         if 'x509certMulti' in self._idp:
@@ -240,6 +251,7 @@ class OneLogin_Saml2_Settings(object):
         :returns: True if the settings info is valid
         :rtype: boolean
         """
+        self._raw_settings = settings
         self._sp = settings.get('sp', {})
         self._idp = settings.get('idp', {})
         self._strict = settings.get('strict', True)
@@ -257,6 +269,30 @@ class OneLogin_Saml2_Settings(object):
 
         self._errors = errors
         return False
+
+    @staticmethod
+    def _idp_has_metadata_source(idp):
+        if not isinstance(idp, dict):
+            return False
+        metadata = idp.get('metadata')
+        if isinstance(metadata, str) and metadata:
+            return True
+        if isinstance(metadata, dict):
+            return bool(
+                metadata.get('url')
+                or metadata.get('metadataUrl')
+                or metadata.get('metadataURL')
+                or metadata.get('file')
+                or metadata.get('path')
+                or metadata.get('metadataFile')
+            )
+        return bool(
+            idp.get('metadataUrl')
+            or idp.get('metadataURL')
+            or idp.get('metadata_url')
+            or idp.get('metadataFile')
+            or idp.get('metadata_file')
+        )
 
     def _load_settings_from_file(self):
         """
@@ -398,12 +434,14 @@ class OneLogin_Saml2_Settings(object):
             else:
                 allow_single_domain_urls = self._get_allow_single_label_domain(settings)
                 idp = settings['idp']
-                if not idp.get('entityId'):
+                has_metadata_source = self._idp_has_metadata_source(idp)
+
+                if not idp.get('entityId') and not has_metadata_source:
                     errors.append('idp_entityId_not_found')
 
-                if not idp.get('singleSignOnService', {}).get('url'):
+                if not idp.get('singleSignOnService', {}).get('url') and not has_metadata_source:
                     errors.append('idp_sso_not_found')
-                elif not validate_url(idp['singleSignOnService']['url'], allow_single_domain_urls):
+                elif idp.get('singleSignOnService', {}).get('url') and not validate_url(idp['singleSignOnService']['url'], allow_single_domain_urls):
                     errors.append('idp_sso_url_invalid')
 
                 slo_url = idp.get('singleLogoutService', {}).get('url')
@@ -413,7 +451,7 @@ class OneLogin_Saml2_Settings(object):
                 if 'security' in settings:
                     security = settings['security']
 
-                    exists_x509 = bool(self.get_idp_cert())
+                    exists_x509 = bool(self.get_idp_cert()) or has_metadata_source
                     exists_fingerprint = bool(idp.get('certFingerprint'))
 
                     exists_multix509sign = 'x509certMulti' in idp and \
@@ -635,7 +673,16 @@ class OneLogin_Saml2_Settings(object):
         :returns: IdP public cert
         :rtype: string
         """
+        self.refresh_metadata_if_due()
         cert = self._idp.get('x509cert')
+        manager = getattr(self, '_metadata_manager', None)
+        if not cert and manager is not None and manager.enabled and manager._metadata_applied:
+            multi = self._idp.get('x509certMulti', {})
+            has_signing = isinstance(multi, dict) and bool(multi.get('signing'))
+            if not has_signing:
+                # Do not fall back to a stale cert file after metadata told us
+                # that every advertised signing certificate is unusable.
+                return None
         cert_file_name = self.get_cert_path() + self._idp['cert_filename']
         if not cert and exists(cert_file_name):
             with open(cert_file_name) as f:
@@ -649,7 +696,126 @@ class OneLogin_Saml2_Settings(object):
         :returns: IdP info
         :rtype: dict
         """
+        self.refresh_metadata_if_due()
         return self._idp
+
+    def refresh_metadata(self, force=True, raise_on_error=False):
+        """
+        Refresh IdP metadata from the configured URL or file.
+
+        This is a no-op when no metadata source is configured.  Existing
+        settings are kept when the refresh fails.
+        """
+        if self._metadata_manager is None:
+            return False
+        return self._metadata_manager.refresh(force=force, raise_on_error=raise_on_error)
+
+    def refresh_metadata_if_due(self):
+        """
+        Refresh IdP metadata when its refresh interval or validUntil elapsed.
+        """
+        manager = getattr(self, '_metadata_manager', None)
+        if manager is None or not manager.auto_refresh or manager._refreshing:
+            return False
+        return manager.refresh_if_due()
+
+    # Compatibility aliases used by applications and integrations.
+    def refresh_idp_metadata(self, force=True, raise_on_error=False):
+        return self.refresh_metadata(force=force, raise_on_error=raise_on_error)
+
+    def reload_metadata(self, force=True, raise_on_error=False):
+        return self.refresh_metadata(force=force, raise_on_error=raise_on_error)
+
+    def update_metadata(self, force=True, raise_on_error=False):
+        return self.refresh_metadata(force=force, raise_on_error=raise_on_error)
+
+    def get_metadata_manager(self):
+        return self._metadata_manager
+
+    def get_idp_metadata_manager(self):
+        return self._metadata_manager
+
+    def is_metadata_refresh_configured(self):
+        return bool(self._metadata_manager is not None and self._metadata_manager.enabled)
+
+    def get_metadata_status(self):
+        if self._metadata_manager is None:
+            return {'enabled': False}
+        return self._metadata_manager.get_status()
+
+    def get_idp_metadata_status(self):
+        return self.get_metadata_status()
+
+    def get_metadata_refresh_status(self):
+        return self.get_metadata_status()
+
+    def get_metadata_last_error(self):
+        if self._metadata_manager is None:
+            return None
+        return self._metadata_manager.get_last_error()
+
+    def get_idp_signing_certs(self, include_retired=True):
+        if self._metadata_manager is not None and self._metadata_manager.enabled:
+            return self._metadata_manager.get_signing_certificates(include_retired=include_retired)
+        certs = []
+        cert = self.get_idp_cert()
+        if cert:
+            certs.append(cert)
+        multi = self._idp.get('x509certMulti', {})
+        if isinstance(multi, dict):
+            for signing_cert in multi.get('signing', []) or []:
+                if signing_cert and signing_cert not in certs:
+                    certs.append(signing_cert)
+        return certs
+
+    def get_idp_signing_certificates(self, include_retired=True):
+        return self.get_idp_signing_certs(include_retired=include_retired)
+
+    def get_idp_certificates(self, include_retired=True):
+        return self.get_idp_signing_certs(include_retired=include_retired)
+
+    def get_idp_certificate_diagnostics(self):
+        if self._metadata_manager is None:
+            return []
+        return self._metadata_manager.get_certificate_diagnostics()
+
+    def get_idp_certificate_status(self):
+        return self.get_idp_certificate_diagnostics()
+
+    def get_rejected_idp_certs(self):
+        if self._metadata_manager is None:
+            return []
+        return self._metadata_manager.get_rejected_certificates()
+
+    def get_idp_rejected_certificates(self):
+        return self.get_rejected_idp_certs()
+
+    def get_metadata_errors(self):
+        return {
+            'lastError': self.get_metadata_last_error(),
+            'lastErrorCode': self._metadata_manager.get_last_error_code() if self._metadata_manager is not None else None,
+        }
+
+    def get_idp_metadata_errors(self):
+        return self.get_metadata_errors()
+
+    def should_validate_idp_certificate_dates(self):
+        """
+        Return whether signature validation must reject expired IdP certs.
+
+        Certificates managed through metadata refresh are always checked.
+        Legacy static settings keep their historical behaviour unless
+        ``security['rejectExpiredCertificates']`` is explicitly set.
+        """
+        for key in (
+            'rejectExpiredCertificates',
+            'rejectExpiredCertificate',
+            'reject_expired_certificates',
+            'checkCertificateValidity',
+        ):
+            if key in self._security:
+                return bool(self._security[key])
+        return bool(self._idp_metadata_managed)
 
     def get_sp_data(self):
         """

@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid38831",
+  "B": "/home/dev/feedback/uid38831",
+  "sha": "faf95f7b24b43644955607ea8bd1da18a1425c7b",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "onelogin",
+    "repo": "python3-saml",
+    "sha": "faf95f7b24b43644955607ea8bd1da18a1425c7b"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "python3-saml",
+    "cloneUrl": "https://github.com/Rrr119/python3-saml.git"
+  },
+  "at": "2026-11-25T17:59:52.942Z"
+}

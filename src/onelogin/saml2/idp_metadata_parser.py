@@ -50,20 +50,22 @@ class OneLogin_Saml2_IdPMetadataParser(object):
         """
         valid = False
 
-        # Respect the no-TLS-certificate validation option
+        if not validate_cert and (cafile or capath):
+            raise ValueError(
+                "Specifying 'cafile' or 'capath' while disabling certificate "
+                "validation is contradictory."
+            )
+
         ctx = None
+        if cafile or capath:
+            ctx = ssl.create_default_context(cafile=cafile, capath=capath)
         if not validate_cert:
-            if cafile or capath:
-                raise ValueError(
-                    "Specifying 'cafile' or 'capath' while disabling certificate "
-                    "validation is contradictory."
-                )
-            ctx = ssl.create_default_context()
+            ctx = ctx or ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
         request = Request(url, headers=headers or {})
-        response = urlopen(request, timeout=timeout, cafile=cafile, capath=capath, context=ctx)
+        response = urlopen(request, timeout=timeout, context=ctx)
         xml = response.read()
 
         if xml:
@@ -81,7 +83,7 @@ class OneLogin_Saml2_IdPMetadataParser(object):
         return xml
 
     @classmethod
-    def parse_remote(cls, url, validate_cert=True, entity_id=None, timeout=None, **kwargs):
+    def parse_remote(cls, url, validate_cert=True, entity_id=None, timeout=None, cafile=None, capath=None, **kwargs):
         """
         Gets the metadata XML from the provided URL and parse it, returning a dict with extracted data
         :param url: Url where the XML of the Identity Provider Metadata is published.
@@ -100,7 +102,14 @@ class OneLogin_Saml2_IdPMetadataParser(object):
         :returns: settings dict with extracted data
         :rtype: dict
         """
-        idp_metadata = cls.get_metadata(url, validate_cert, timeout, headers=kwargs.pop("headers", None))
+        idp_metadata = cls.get_metadata(
+            url,
+            validate_cert=validate_cert,
+            cafile=cafile,
+            capath=capath,
+            timeout=timeout,
+            headers=kwargs.pop("headers", None),
+        )
         return cls.parse(idp_metadata, entity_id=entity_id, **kwargs)
 
     @classmethod

@@ -36,8 +36,20 @@ class OneLogin_Saml2_Error(Exception):
     SAML_SINGLE_LOGOUT_NOT_SUPPORTED = 12
     PRIVATE_KEY_NOT_FOUND = 13
     UNSUPPORTED_SETTINGS_OBJECT = 14
+    METADATA_FETCH_FAILED = 15
+    METADATA_INVALID = 16
+    METADATA_EXPIRED = 17
+    METADATA_SIGNATURE_INVALID = 18
+    METADATA_SIGNING_CERT_MISSING = 19
+    METADATA_SIGNING_CERT_EXPIRED = 20
+    METADATA_REFRESH_FAILED = 21
+    METADATA_FETCH_ERROR = METADATA_FETCH_FAILED
+    METADATA_PARSE_ERROR = METADATA_INVALID
+    METADATA_EXPIRED_ERROR = METADATA_EXPIRED
+    METADATA_REFRESH_ERROR = METADATA_REFRESH_FAILED
+    METADATA_ROTATION_FAILED = METADATA_REFRESH_FAILED
 
-    def __init__(self, message, code=0, errors=None):
+    def __init__(self, message, code=0, errors=None, reason=None, details=None):
         """
         Initializes the Exception instance.
 
@@ -52,6 +64,11 @@ class OneLogin_Saml2_Error(Exception):
 
         Exception.__init__(self, message)
         self.code = code
+        self.reason = reason
+        self.details = details or {}
+
+    def get_reason(self):
+        return self.reason
 
 
 class OneLogin_Saml2_ValidationError(Exception):
@@ -110,8 +127,20 @@ class OneLogin_Saml2_ValidationError(Exception):
     AUTHN_CONTEXT_MISMATCH = 45
     DEPRECATED_SIGNATURE_METHOD = 46
     DEPRECATED_DIGEST_METHOD = 47
+    SIGNATURE_CERT_EXPIRED = 48
+    SIGNATURE_CERT_NOT_YET_VALID = 49
+    SIGNATURE_CERT_INVALID = 50
+    SIGNATURE_CERT_NOT_FOUND = 51
+    SIGNATURE_MISMATCH = 52
+    CERT_EXPIRED = SIGNATURE_CERT_EXPIRED
+    CERT_NOT_YET_VALID = SIGNATURE_CERT_NOT_YET_VALID
+    CERT_INVALID = SIGNATURE_CERT_INVALID
+    INVALID_SIGNATURE_CERT = SIGNATURE_CERT_INVALID
+    CERTIFICATE_EXPIRED = SIGNATURE_CERT_EXPIRED
+    CERTIFICATE_NOT_YET_VALID = SIGNATURE_CERT_NOT_YET_VALID
+    NO_VALID_CERTIFICATE = SIGNATURE_CERT_NOT_FOUND
 
-    def __init__(self, message, code=0, errors=None):
+    def __init__(self, message, code=0, errors=None, reason=None, details=None):
         """
         Initializes the Exception instance.
         Arguments are:
@@ -125,3 +154,8 @@ class OneLogin_Saml2_ValidationError(Exception):
 
         Exception.__init__(self, message)
         self.code = code
+        self.reason = reason
+        self.details = details or {}
+
+    def get_reason(self):
+        return self.reason

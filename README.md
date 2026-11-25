@@ -991,6 +991,67 @@ The ``x509certMulti`` is an array with 2 keys:
 - ``signing``: An array of certs that will be used to validate IdP signature
 - ``encryption``: An array with one unique cert that will be used to encrypt data to be sent to the IdP.
 
+### IdP metadata refresh and certificate rollover ###
+
+IdP metadata can be refreshed automatically. This is useful when several IdPs
+rotate their signing certificates at different times. Metadata refresh is
+configured per IdP, so each IdP keeps its own refresh interval and rollover
+window:
+
+```json
+{
+    "idp": {
+        "metadata": {
+            "url": "https://idp.example.com/metadata",
+            "refreshInterval": 3600,
+            "rotationGracePeriod": 86400,
+            "timeout": 10,
+            "validateCert": true
+        }
+    }
+}
+```
+
+``refreshInterval`` is in seconds and defaults to one hour. The metadata
+``validUntil``/``cacheDuration`` values are also honoured. When a refresh
+fails the previously loaded metadata is kept, so an unavailable IdP metadata
+endpoint does not invalidate existing login sessions.
+
+``rotationGracePeriod`` is the time in seconds during which a valid signing
+certificate removed from the published metadata remains trusted. This covers
+the overlap where an IdP has switched to a new key but responses signed with
+the previous key may still be in flight. Expired or not-yet-valid
+certificates are never added to the trusted signing set.
+
+The same values can be supplied through ``idp.metadataUrl``,
+``idp.metadataRefreshInterval`` and
+``idp.certificateRotationGracePeriod`` for applications that already build the
+IdP settings as a flat dictionary. Existing settings without a metadata source
+continue to work unchanged.
+
+Refresh can also be triggered explicitly:
+
+```python
+settings.refresh_metadata(force=True)
+status = settings.get_metadata_status()
+```
+
+``status`` reports refresh failures, retired certificates and rejected
+certificates (including the validity date that caused the rejection). To
+refresh all IdPs managed by an application:
+
+```python
+from onelogin.saml2.metadata_manager import refresh_metadata
+
+refresh_metadata([settings_idp_a, settings_idp_b, settings_idp_c])
+```
+
+For strict validation of manually configured certificates (outside the
+metadata refresh path), set ``security.rejectExpiredCertificates`` to
+``true``. Signature failures expose the reason through
+``Response.get_error()``/``Response.get_error_code()`` and
+``Auth.get_last_error_reason()``/``Auth.get_last_error_code()``.
+
 
 ### Replay attacks ###
 

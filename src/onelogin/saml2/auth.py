@@ -66,6 +66,7 @@ class OneLogin_Saml2_Auth(object):
         self._authenticated = False
         self._errors = []
         self._error_reason = None
+        self._error_code = None
         self._last_request_id = None
         self._last_message_id = None
         self._last_assertion_id = None
@@ -122,6 +123,8 @@ class OneLogin_Saml2_Auth(object):
         """
         self._errors = []
         self._error_reason = None
+        self._error_code = None
+        self._settings.refresh_metadata_if_due()
 
         if "post_data" in self._request_data and "SAMLResponse" in self._request_data["post_data"]:
             # AuthnResponse -- HTTP_POST Binding
@@ -152,6 +155,8 @@ class OneLogin_Saml2_Auth(object):
         """
         self._errors = []
         self._error_reason = None
+        self._error_code = None
+        self._settings.refresh_metadata_if_due()
 
         get_data = "get_data" in self._request_data and self._request_data["get_data"]
         if get_data and "SAMLResponse" in get_data:
@@ -320,6 +325,12 @@ class OneLogin_Saml2_Auth(object):
         """
         return self._error_reason
 
+    def get_last_error_code(self):
+        """
+        Returns the error code of the last validation error, when available.
+        """
+        return self._error_code
+
     def get_attribute(self, name):
         """
         Returns the requested SAML attribute.
@@ -410,6 +421,7 @@ class OneLogin_Saml2_Auth(object):
         :returns: Redirection URL
         :rtype: string
         """
+        self._settings.refresh_metadata_if_due()
         authn_request = self.authn_request_class(self._settings, force_authn, is_passive, set_nameid_policy, name_id_value_req)
         self._last_request = authn_request.get_xml()
         self._last_request_id = authn_request.get_id()
@@ -647,12 +659,17 @@ class OneLogin_Saml2_Auth(object):
                 return True
 
             idp_data = self.get_settings().get_idp_data()
+            idp_entity_id = idp_data.get("entityId")
 
             exists_x509cert = self.get_settings().get_idp_cert() is not None
             exists_multix509sign = "x509certMulti" in idp_data and "signing" in idp_data["x509certMulti"] and idp_data["x509certMulti"]["signing"]
 
             if not (exists_x509cert or exists_multix509sign):
                 error_msg = "In order to validate the sign on the %s, the x509cert of the IdP is required" % saml_type
+                if hasattr(self._settings, "get_metadata_last_error"):
+                    metadata_error = self._settings.get_metadata_last_error()
+                    if metadata_error:
+                        error_msg += "; last metadata refresh failed: %s" % metadata_error
                 self._errors.append(error_msg)
                 raise OneLogin_Saml2_Error(error_msg, OneLogin_Saml2_Error.CERT_NOT_FOUND)
 
@@ -674,18 +691,59 @@ class OneLogin_Saml2_Auth(object):
                 signed_query = self._build_sign_query(data[saml_type], data.get("RelayState"), sign_alg, saml_type, lowercase_urlencoding)
 
             if exists_multix509sign:
+                check_cert_validity = False
+                if hasattr(self._settings, "should_validate_idp_certificate_dates"):
+                    check_cert_validity = self._settings.should_validate_idp_certificate_dates()
+                failures = []
                 for cert in idp_data["x509certMulti"]["signing"]:
-                    if OneLogin_Saml2_Utils.validate_binary_sign(signed_query, OneLogin_Saml2_Utils.b64decode(signature), cert, sign_alg):
-                        return True
-                raise OneLogin_Saml2_ValidationError("Signature validation failed. %s rejected" % saml_type, OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
+                    try:
+                        if OneLogin_Saml2_Utils.validate_binary_sign(
+                            signed_query,
+                            OneLogin_Saml2_Utils.b64decode(signature),
+                            cert,
+                            sign_alg,
+                            check_cert_validity=check_cert_validity,
+                            idp_entity_id=idp_entity_id,
+                        ):
+                            return True
+                        failures.append("certificate %s did not match the signature" % OneLogin_Saml2_Utils.calculate_x509_fingerprint(cert, "sha256"))
+                    except Exception as exc:
+                        failures.append(str(exc))
+                reason = "; ".join(failures)
+                code = OneLogin_Saml2_ValidationError.INVALID_SIGNATURE
+                if check_cert_validity and any("expired" in failure.lower() for failure in failures):
+                    code = OneLogin_Saml2_ValidationError.SIGNATURE_CERT_EXPIRED
+                message = "Signature validation failed. %s rejected" % saml_type
+                if check_cert_validity:
+                    message += ". " + reason
+                raise OneLogin_Saml2_ValidationError(
+                    message,
+                    code,
+                    reason=reason,
+                )
             else:
                 cert = self.get_settings().get_idp_cert()
 
-                if not OneLogin_Saml2_Utils.validate_binary_sign(signed_query, OneLogin_Saml2_Utils.b64decode(signature), cert, sign_alg, self._settings.is_debug_active()):
-                    raise OneLogin_Saml2_ValidationError("Signature validation failed. %s rejected" % saml_type, OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
+                check_cert_validity = False
+                if hasattr(self._settings, "should_validate_idp_certificate_dates"):
+                    check_cert_validity = self._settings.should_validate_idp_certificate_dates()
+                if not OneLogin_Saml2_Utils.validate_binary_sign(
+                    signed_query,
+                    OneLogin_Saml2_Utils.b64decode(signature),
+                    cert,
+                    sign_alg,
+                    self._settings.is_debug_active(),
+                    check_cert_validity=check_cert_validity,
+                    idp_entity_id=idp_entity_id,
+                ):
+                    message = "Signature validation failed. %s rejected" % saml_type
+                    if check_cert_validity:
+                        message += ". The configured IdP signing certificate did not validate the signature"
+                    raise OneLogin_Saml2_ValidationError(message, OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
             return True
         except Exception as e:
             self._error_reason = str(e)
+            self._error_code = getattr(e, "code", None)
             if raise_exceptions:
                 raise e
             return False
